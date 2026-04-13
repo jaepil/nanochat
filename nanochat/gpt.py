@@ -408,17 +408,38 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _poe_layer_loss(self, x, targets):
-        """Compute CE loss from a hidden state through the shared lm_head.
+    def _poe_layer_loss(self, x, targets, teacher_top_logits=None, teacher_top_indices=None,
+                        kd_alpha=0.5, kd_temperature=2.0):
+        """Compute CE loss (+ optional KD loss) from a hidden state through the shared lm_head.
         Used by PoE local learning. Gradient-checkpointed to avoid storing
         full (B, T, vocab_size) logit tensors at every layer."""
         softcap = 15
         logits = self.lm_head(norm(x))
         logits = logits[..., :self.config.vocab_size].float()
         logits = softcap * torch.tanh(logits / softcap)
-        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        if teacher_top_logits is not None:
+            kd_loss = self._kd_loss(logits.view(-1, logits.size(-1)), teacher_top_logits, teacher_top_indices, kd_temperature)
+            return kd_alpha * ce_loss + (1 - kd_alpha) * kd_loss
+        return ce_loss
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', poe_mode=None, poe_every=1):
+    def _kd_loss(self, student_logits, teacher_top_logits, teacher_top_indices, temperature=2.0):
+        """Compute KD loss using sparse teacher logits (top-K only).
+        Uses KL divergence between student and teacher soft distributions."""
+        B_T, V = student_logits.shape
+        K = teacher_top_logits.shape[-1]
+        # Build sparse teacher logits: fill non-top-K positions with -inf
+        teacher_full = torch.full_like(student_logits, float('-inf'))
+        teacher_full.scatter_(-1, teacher_top_indices.view(B_T, K).long(), teacher_top_logits.view(B_T, K).float())
+        # Softmax with temperature
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_full / temperature, dim=-1)
+        # KL divergence (only non-zero teacher probs contribute)
+        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (temperature ** 2)
+        return kd_loss
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', poe_mode=None, poe_every=1,
+                teacher_top_logits=None, teacher_top_indices=None, kd_alpha=0.5, kd_temperature=2.0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -475,7 +496,8 @@ class GPT(nn.Module):
             # PoE: expert head at stage boundaries (every poe_every layers + last layer)
             if poe_loss is not None and ((i + 1) % poe_every == 0 or i == n_layer - 1):
                 poe_loss = poe_loss + torch.utils.checkpoint.checkpoint(
-                    self._poe_layer_loss, x, targets, use_reentrant=False,
+                    self._poe_layer_loss, x, targets, teacher_top_logits, teacher_top_indices,
+                    kd_alpha, kd_temperature, use_reentrant=False,
                 )
                 poe_head_count += 1
         # PoE mode: return averaged per-stage loss, skip final projection
@@ -497,8 +519,13 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Knowledge distillation: blend CE with KL divergence from teacher
+            if teacher_top_logits is not None:
+                kd_loss = self._kd_loss(logits.view(-1, logits.size(-1)), teacher_top_logits, teacher_top_indices, kd_temperature)
+                loss = kd_alpha * ce_loss + (1 - kd_alpha) * kd_loss
+            else:
+                loss = ce_loss
             return loss
         else:
             # inference: just return the logits directly

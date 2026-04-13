@@ -80,11 +80,36 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 # PoE local learning experiment
 parser.add_argument("--poe-mode", type=str, default="none", choices=["none", "flat", "hier"], help="PoE local learning mode: none=standard backprop, flat=detach between layers, hier=per-layer CE with gradient flow")
 parser.add_argument("--poe-every", type=int, default=1, help="place PoE expert head every N layers (1=all layers, 5=every 5th for pipeline stages)")
+# Knowledge distillation
+parser.add_argument("--kd-logits-dir", type=str, default="", help="directory with teacher logits for KD (empty = no KD)")
+parser.add_argument("--kd-alpha", type=float, default=0.5, help="KD loss weight: alpha * CE(hard) + (1-alpha) * KL(soft)")
+parser.add_argument("--kd-temperature", type=float, default=2.0, help="KD softmax temperature")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 poe_mode = None if args.poe_mode == "none" else args.poe_mode
 if poe_mode is not None:
     print(f"PoE local learning mode: {poe_mode}")
+# KD setup: load teacher logits iterator
+kd_iter = None
+if args.kd_logits_dir:
+    import glob, json as _json
+    kd_files = sorted(glob.glob(os.path.join(args.kd_logits_dir, "logits_*.pt")))
+    assert len(kd_files) > 0, f"No logit files found in {args.kd_logits_dir}"
+    kd_meta_path = os.path.join(args.kd_logits_dir, "meta.json")
+    if os.path.exists(kd_meta_path):
+        with open(kd_meta_path) as f:
+            kd_meta = _json.load(f)
+        print(f"KD: {len(kd_files)} logit files, teacher={kd_meta.get('teacher','?')}, top_k={kd_meta.get('top_k','?')}")
+    else:
+        print(f"KD: {len(kd_files)} logit files")
+    def _kd_logits_iterator(files):
+        """Infinite iterator over teacher logit files."""
+        while True:
+            for f in files:
+                data = torch.load(f, map_location="cpu", weights_only=True)
+                yield data["top_logits"], data["top_indices"]
+    kd_iter = iter(_kd_logits_iterator(kd_files))
+    print(f"KD: alpha={args.kd_alpha}, temperature={args.kd_temperature}")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -514,7 +539,17 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, poe_mode=poe_mode, poe_every=args.poe_every)
+        # Load teacher logits for KD if available
+        kd_kwargs = {}
+        if kd_iter is not None:
+            t_logits, t_indices = next(kd_iter)
+            # Truncate/pad to match current batch shape
+            B_cur, T_cur = x.shape
+            t_logits = t_logits[:B_cur, :T_cur].to(device)
+            t_indices = t_indices[:B_cur, :T_cur].to(device)
+            kd_kwargs = dict(teacher_top_logits=t_logits, teacher_top_indices=t_indices,
+                           kd_alpha=args.kd_alpha, kd_temperature=args.kd_temperature)
+        loss = model(x, y, poe_mode=poe_mode, poe_every=args.poe_every, **kd_kwargs)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
