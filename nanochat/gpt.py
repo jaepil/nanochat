@@ -408,7 +408,17 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _poe_layer_loss(self, x, targets):
+        """Compute CE loss from a hidden state through the shared lm_head.
+        Used by PoE local learning. Gradient-checkpointed to avoid storing
+        full (B, T, vocab_size) logit tensors at every layer."""
+        softcap = 15
+        logits = self.lm_head(norm(x))
+        logits = logits[..., :self.config.vocab_size].float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', poe_mode=None, poe_every=1):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -448,12 +458,31 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # PoE local learning: accumulate per-layer CE losses
+        poe_loss = None
+        poe_head_count = 0
+        if poe_mode is not None and targets is not None:
+            poe_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         for i, block in enumerate(self.transformer.h):
+            # PoE flat: break gradient flow at stage boundaries
+            if poe_mode == 'flat' and i > 0 and i % poe_every == 0:
+                x = x.detach()
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+            # PoE: expert head at stage boundaries (every poe_every layers + last layer)
+            if poe_loss is not None and ((i + 1) % poe_every == 0 or i == n_layer - 1):
+                poe_loss = poe_loss + torch.utils.checkpoint.checkpoint(
+                    self._poe_layer_loss, x, targets, use_reentrant=False,
+                )
+                poe_head_count += 1
+        # PoE mode: return averaged per-stage loss, skip final projection
+        if poe_loss is not None:
+            # Touch unused parameters with zero so DDP all_reduce doesn't get None grads
+            poe_loss = poe_loss + 0.0 * (self.backout_lambda.sum() + self.smear_gate.weight.sum() + self.smear_lambda.sum())
+            return poe_loss / poe_head_count
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout

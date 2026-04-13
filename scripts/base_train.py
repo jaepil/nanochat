@@ -77,8 +77,14 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# PoE local learning experiment
+parser.add_argument("--poe-mode", type=str, default="none", choices=["none", "flat", "hier"], help="PoE local learning mode: none=standard backprop, flat=detach between layers, hier=per-layer CE with gradient flow")
+parser.add_argument("--poe-every", type=int, default=1, help="place PoE expert head every N layers (1=all layers, 5=every 5th for pipeline stages)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+poe_mode = None if args.poe_mode == "none" else args.poe_mode
+if poe_mode is not None:
+    print(f"PoE local learning mode: {poe_mode}")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -508,7 +514,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, poe_mode=poe_mode, poe_every=args.poe_every)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
