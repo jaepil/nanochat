@@ -75,20 +75,36 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--keep-last-n-checkpoints", type=int, default=-1, help="keep only the last N checkpoints to save disk (-1 = keep all)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # PoE local learning experiment
 parser.add_argument("--poe-mode", type=str, default="none", choices=["none", "flat", "hier"], help="PoE local learning mode: none=standard backprop, flat=detach between layers, hier=per-layer CE with gradient flow")
 parser.add_argument("--poe-every", type=int, default=1, help="place PoE expert head every N layers (1=all layers, 5=every 5th for pipeline stages)")
+parser.add_argument("--poe-alpha", type=float, default=0.0, help="PoE loss aggregation exponent: loss / n^(1-alpha). 0.0=uniform avg (current), 0.5=sqrt(n) scaling (Bayesian SNR), 1.0=pure sum")
 # Knowledge distillation
 parser.add_argument("--kd-logits-dir", type=str, default="", help="directory with teacher logits for KD (empty = no KD)")
 parser.add_argument("--kd-alpha", type=float, default=0.5, help="KD loss weight: alpha * CE(hard) + (1-alpha) * KL(soft)")
 parser.add_argument("--kd-temperature", type=float, default=2.0, help="KD softmax temperature")
+# PoE pipeline parallelism (cross-node model split at PoE detach boundaries)
+parser.add_argument("--pipeline-rank", type=int, default=-1, help="pipeline rank: 0=first half of layers, 1=second half (-1=disabled)")
+parser.add_argument("--pipeline-peer-addr", type=str, default="", help="IP address of the other pipeline node")
+parser.add_argument("--pipeline-port", type=int, default=29600, help="base TCP port for pipeline activation transfer")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 poe_mode = None if args.poe_mode == "none" else args.poe_mode
 if poe_mode is not None:
-    print(f"PoE local learning mode: {poe_mode}")
+    print(f"PoE local learning mode: {poe_mode}, poe_every={args.poe_every}, poe_alpha={args.poe_alpha} (normalization=n^(1-alpha))")
+# Pipeline parallelism setup
+pipeline_enabled = args.pipeline_rank >= 0
+pipeline_comm = None
+pipeline_split_layer = None
+if pipeline_enabled:
+    assert poe_mode == 'flat', "Pipeline parallelism requires --poe-mode=flat"
+    assert args.pipeline_peer_addr, "Pipeline parallelism requires --pipeline-peer-addr"
+    from nanochat.pipeline import get_pipeline_split
+    pipeline_split_layer = get_pipeline_split(args.depth, args.poe_every)
+    print(f"Pipeline parallelism: rank={args.pipeline_rank}, split_layer={pipeline_split_layer}/{args.depth}, peer={args.pipeline_peer_addr}")
 # KD setup: load teacher logits iterator
 kd_iter = None
 if args.kd_logits_dir:
@@ -275,6 +291,17 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+
+# Initialize pipeline communication after model is compiled
+if pipeline_enabled:
+    from nanochat.pipeline import PipelineComm
+    pipeline_comm = PipelineComm(
+        pipeline_rank=args.pipeline_rank,
+        peer_addr=args.pipeline_peer_addr,
+        base_port=args.pipeline_port,
+        local_rank=ddp_local_rank,
+    )
+    print0(f"Pipeline communication established (rank {args.pipeline_rank}, local_rank {ddp_local_rank})")
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -527,6 +554,7 @@ while True:
                 },
             },
             rank=ddp_rank,
+            keep_last_n=args.keep_last_n_checkpoints if args.keep_last_n_checkpoints > 0 else None,
         )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
@@ -549,7 +577,13 @@ while True:
             t_indices = t_indices[:B_cur, :T_cur].to(device)
             kd_kwargs = dict(teacher_top_logits=t_logits, teacher_top_indices=t_indices,
                            kd_alpha=args.kd_alpha, kd_temperature=args.kd_temperature)
-        loss = model(x, y, poe_mode=poe_mode, poe_every=args.poe_every, **kd_kwargs)
+        if pipeline_enabled:
+            from nanochat.pipeline import pipeline_forward
+            loss = pipeline_forward(orig_model, x, y, args.poe_every, args.poe_alpha,
+                                    args.pipeline_rank, pipeline_split_layer, pipeline_comm, device)
+        else:
+            # Standard forward (compiled model, DDP handles gradient sync automatically)
+            loss = model(x, y, poe_mode=poe_mode, poe_every=args.poe_every, poe_alpha=args.poe_alpha, **kd_kwargs)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -557,6 +591,12 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    # Pipeline mode: manually all-reduce gradients across local DDP ranks
+    # (pipeline_forward uses orig_model which bypasses DDP's automatic gradient sync)
+    if pipeline_enabled and ddp:
+        for p in orig_model.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -667,5 +707,7 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
+if pipeline_comm is not None:
+    pipeline_comm.close()
 wandb_run.finish() # wandb run finish
 compute_cleanup()

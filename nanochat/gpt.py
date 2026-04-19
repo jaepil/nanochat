@@ -439,6 +439,7 @@ class GPT(nn.Module):
         return kd_loss
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', poe_mode=None, poe_every=1,
+                poe_alpha=0.0,
                 teacher_top_logits=None, teacher_top_indices=None, kd_alpha=0.5, kd_temperature=2.0):
         B, T = idx.size()
 
@@ -500,11 +501,15 @@ class GPT(nn.Module):
                     kd_alpha, kd_temperature, use_reentrant=False,
                 )
                 poe_head_count += 1
-        # PoE mode: return averaged per-stage loss, skip final projection
+        # PoE mode: return aggregated per-stage loss, skip final projection
+        # Normalization: poe_loss / n^(1-alpha) generalizes Bayesian PoE aggregation
+        # alpha=0.0: uniform average (conjunction shrinkage, Log-OP)
+        # alpha=0.5: sqrt(n) scaling (independent-observation SNR accumulation)
+        # alpha=1.0: pure sum (no normalization)
         if poe_loss is not None:
             # Touch unused parameters with zero so DDP all_reduce doesn't get None grads
             poe_loss = poe_loss + 0.0 * (self.backout_lambda.sum() + self.smear_gate.weight.sum() + self.smear_lambda.sum())
-            return poe_loss / poe_head_count
+            return poe_loss / (poe_head_count ** (1.0 - poe_alpha))
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout

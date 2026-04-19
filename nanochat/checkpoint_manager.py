@@ -39,7 +39,47 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def _rotate_checkpoints(checkpoint_dir, keep_last_n, current_step, rank):
+    """Delete older checkpoints, keeping only the last N (by step number).
+
+    Each rank deletes only its own optim shard files. Rank 0 also deletes
+    model and meta files. The current step is never deleted.
+    """
+    # Find all steps present in the directory (via model_*.pt for rank 0, optim_*_rankN.pt for others)
+    if rank == 0:
+        pattern = os.path.join(checkpoint_dir, "model_*.pt")
+        step_regex = re.compile(r"model_(\d+)\.pt$")
+    else:
+        pattern = os.path.join(checkpoint_dir, f"optim_*_rank{rank:d}.pt")
+        step_regex = re.compile(rf"optim_(\d+)_rank{rank:d}\.pt$")
+    files = glob.glob(pattern)
+    steps = set()
+    for f in files:
+        m = step_regex.search(os.path.basename(f))
+        if m:
+            steps.add(int(m.group(1)))
+    # Keep the current step and the N-1 most recent before it
+    steps_sorted = sorted(steps, reverse=True)
+    keep = set(steps_sorted[:keep_last_n])
+    keep.add(current_step)
+    # Delete older steps
+    for step in steps:
+        if step in keep:
+            continue
+        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        optim_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
+        if rank == 0:
+            for p in (model_path, meta_path):
+                if os.path.exists(p):
+                    os.remove(p)
+                    logger.info(f"Rotated out: {p}")
+        if os.path.exists(optim_path):
+            os.remove(optim_path)
+            logger.info(f"Rotated out: {optim_path}")
+
+
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, keep_last_n=None):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -57,6 +97,9 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+    # Rotate old checkpoints after successful save
+    if keep_last_n is not None and keep_last_n > 0:
+        _rotate_checkpoints(checkpoint_dir, keep_last_n, step, rank)
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
