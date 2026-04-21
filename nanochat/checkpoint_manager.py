@@ -79,6 +79,63 @@ def _rotate_checkpoints(checkpoint_dir, keep_last_n, current_step, rank):
             logger.info(f"Rotated out: {optim_path}")
 
 
+def save_stage_delta(checkpoint_dir, step, model, base_model_dir, meta_data, rank=0, keep_last_n=None):
+    """Save only the dual-head / stage-extension *delta* (paper §6.5).
+
+    Persists just the trainable-stage weights (new layer params, specialist
+    `lm_head_stage`, warm-inited `wte`, and the full `resid_lambdas` /
+    `x0_lambdas` scalar tensors), plus a pointer to the frozen base checkpoint
+    so the specialist can be reconstructed at load time.
+
+    Args:
+        checkpoint_dir: where to write `model_{step}.pt` + `meta_{step}.json`.
+        step: global step index used for filenames.
+        model: an `nn.Module` whose state_dict we filter (unwrap DDP/compile
+            prefixes if needed).
+        base_model_dir: string pointer to the frozen base-model checkpoint dir
+            (stored inside the meta so loaders can rehydrate the full model).
+        meta_data: dict to persist alongside the delta.
+        rank: DDP rank (only rank 0 writes).
+        keep_last_n: if set, rotate older delta checkpoints.
+
+    Delta selection rules (mirror nanochat-mlx `save_stage_weights`):
+      - `transformer.h.{i}.*` where `i >= frozen_layers`  (new stage layers)
+      - `lm_head_stage.*`                                  (specialist, dual-head)
+      - `lm_head.*`                                        (only when NOT dual-head
+        — with dual-head the base head stays frozen and duplicating it wastes space)
+      - `transformer.wte.*`                                (chat special-token warm-init)
+      - `resid_lambdas`, `x0_lambdas`                      (tiny, full tensors kept)
+    """
+    frozen_layers = int(getattr(model.config, "frozen_layers", 0))
+    dual_head = bool(getattr(model.config, "dual_head", False))
+    raw_sd = model.state_dict()
+    sd = {k.removeprefix("_orig_mod."): v for k, v in raw_sd.items()}
+    delta = {}
+    for k, v in sd.items():
+        if k.startswith("transformer.h."):
+            layer_idx = int(k.split(".")[2])
+            if layer_idx >= frozen_layers:
+                delta[k] = v
+        elif k.startswith("lm_head_stage."):
+            delta[k] = v
+        elif k.startswith("lm_head."):
+            if not dual_head:
+                delta[k] = v
+        elif k.startswith("transformer.wte."):
+            delta[k] = v
+        elif k in ("resid_lambdas", "x0_lambdas"):
+            delta[k] = v
+    meta_out = dict(meta_data)
+    meta_out["base_model_dir"] = str(base_model_dir)
+    meta_out["dual_head"] = dual_head
+    meta_out["frozen_layers"] = frozen_layers
+    save_checkpoint(checkpoint_dir, step, delta, None, meta_out, rank=rank, keep_last_n=keep_last_n)
+    if rank == 0:
+        n_params = sum(v.numel() for v in delta.values() if hasattr(v, 'numel'))
+        size_mb = sum(v.numel() * v.element_size() for v in delta.values() if hasattr(v, 'numel')) / 1e6
+        logger.info(f"Saved stage delta: {len(delta)} tensors, {n_params:,} params, {size_mb:.1f} MB")
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, keep_last_n=None):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
