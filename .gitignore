@@ -4,6 +4,7 @@ __pycache__/
 dev-ignore/
 report.md
 eval_bundle/
+checkpoints/
 
 # Secrets
 .env
@@ -11,3 +12,8 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# Cloud launch scripts (local environment specific)
+scripts/aws_*.sh
+scripts/gcp_*.sh
+scripts/run_chinchilla_*.sh
