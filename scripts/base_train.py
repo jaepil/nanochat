@@ -82,6 +82,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 parser.add_argument("--poe-mode", type=str, default="none", choices=["none", "flat", "hier"], help="PoE local learning mode: none=standard backprop, flat=detach between layers, hier=per-layer CE with gradient flow")
 parser.add_argument("--poe-every", type=int, default=1, help="place PoE expert head every N layers (1=all layers, 5=every 5th for pipeline stages)")
 parser.add_argument("--poe-alpha", type=float, default=0.0, help="PoE loss aggregation exponent: loss / n^(1-alpha). 0.0=uniform avg (current), 0.5=sqrt(n) scaling (Bayesian SNR), 1.0=pure sum")
+parser.add_argument("--per-stage-head", action="store_true", help="Unified per-stage head architecture: each PoE boundary gets its own trainable projection head that composes additively with the shared lm_head (logits_k = lm_head(x) + lm_head_stage_k(x))")
 # Knowledge distillation
 parser.add_argument("--kd-logits-dir", type=str, default="", help="directory with teacher logits for KD (empty = no KD)")
 parser.add_argument("--kd-alpha", type=float, default=0.5, help="KD loss weight: alpha * CE(hard) + (1-alpha) * KL(soft)")
@@ -147,21 +148,27 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
+from nanochat.flash_attention import USE_FA3, USE_FA2, HAS_FA2, BACKEND
 using_fa3 = USE_FA3
 if using_fa3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif USE_FA2:
+    print0("✓ Using Flash Attention 2 (Ampere/Ada GPU detected, flash-attn pip package).")
 else:
     print0("!" * 80)
     if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    elif HAS_FA2 and COMPUTE_DTYPE not in (torch.bfloat16, torch.float16):
+        print0(f"WARNING: Flash Attention 2 requires bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+        print0("WARNING: Flash Attention not available, using PyTorch SDPA fallback")
+        print0("HINT: On Ampere/Ada (A100/A6000/A10), install `flash-attn` for 2-3x speedup: pip install flash-attn --no-build-isolation")
+    print0("WARNING: Training will be less efficient without Flash Attention")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
     print0("!" * 80)
+print0(f"Attention backend: {BACKEND.upper()}")
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -184,6 +191,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        per_stage_head=args.per_stage_head,
+        poe_every=args.poe_every,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

@@ -1,8 +1,11 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified Flash Attention interface with automatic FA3/FA2/SDPA switching.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on non-Hopper GPUs (including Blackwell), MPS, and CPU.
+Exports `flash_attn` module that matches the FA3 API exactly, and picks the
+fastest available backend at import time:
+    - FA3 on Hopper (sm90, bf16 only)
+    - FA2 on Ampere+/Ada (sm80+) when flash-attn pip package is installed
+    - PyTorch SDPA fallback otherwise (MPS, CPU, or sm < 8.0)
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -15,6 +18,7 @@ Usage (drop-in replacement for FA3):
 """
 import torch
 import torch.nn.functional as F
+from types import SimpleNamespace
 
 
 # =============================================================================
@@ -41,26 +45,62 @@ def _load_flash_attention_3():
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
+
+# =============================================================================
+# Detection: Try to load FA2 (pip package: flash-attn) as intermediate backend
+# for Ampere (sm80) / Ada (sm89) where FA3 Hopper kernels are not compiled.
+# =============================================================================
+def _load_flash_attention_2():
+    """Try to load Flash Attention 2 (pip: flash-attn). Works on sm80+."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        # FA2 supports Ampere (sm80) and above
+        if major < 8:
+            return None
+        from flash_attn import flash_attn_func as _fa2_func
+        from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
+        return SimpleNamespace(
+            flash_attn_func=_fa2_func,
+            flash_attn_with_kvcache=_fa2_kvcache,
+        )
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+_fa2 = _load_flash_attention_2()
+HAS_FA2 = _fa2 is not None
+
+# Override for testing: set to 'fa3', 'fa2', 'sdpa', or None (auto)
 _override_impl = None
 
 
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
-    if _override_impl == 'fa3':
-        assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
-    if _override_impl == 'sdpa':
-        return False
+def _resolve_backend():
+    """Pick the best available backend. Returns one of 'fa3', 'fa2', 'sdpa'."""
+    if _override_impl is not None:
+        if _override_impl == 'fa3':
+            assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
+        if _override_impl == 'fa2':
+            assert HAS_FA2, "Cannot override to FA2: not available (install flash-attn)"
+        return _override_impl
     if HAS_FA3:
-        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
         from nanochat.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
+            return 'fa3'
+    if HAS_FA2:
+        from nanochat.common import COMPUTE_DTYPE
+        # FA2 supports bf16 and fp16; fp32 must use SDPA
+        if COMPUTE_DTYPE in (torch.bfloat16, torch.float16):
+            return 'fa2'
+    return 'sdpa'
 
-USE_FA3 = _resolve_use_fa3()
+
+BACKEND = _resolve_backend()
+USE_FA3 = (BACKEND == 'fa3')
+USE_FA2 = (BACKEND == 'fa2')
 
 
 # =============================================================================
@@ -119,6 +159,9 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
+    if USE_FA2:
+        return _fa2.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
@@ -148,6 +191,12 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     """
     if USE_FA3:
         return _fa3.flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
+            causal=causal, window_size=window_size
+        )
+
+    if USE_FA2:
+        return _fa2.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )

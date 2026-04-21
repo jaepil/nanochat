@@ -37,6 +37,23 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Dual-head specialist stage (paper §6.5 / §10.2): when True, adds a zero-init
+    # `lm_head_stage` (specialist head) alongside the shared base `lm_head`. At the
+    # final stage boundary during SFT, logits are summed (Log-OP / PoE algebra):
+    # logits = lm_head(x) + lm_head_stage(x). Base head stays frozen; specialist
+    # accumulates a chat-register projection. Inference `head_mode` selects
+    # which heads apply ("dual" | "base" | "spec").
+    dual_head: bool = False
+    # Number of leading layers whose gradients are blocked (paper §6.1 elastic
+    # depth). Used with --new-layers in specialist_sft_stage5 to freeze the pretrained
+    # prefix while training only the new stage.
+    frozen_layers: int = 0
+    # Unified per-stage head architecture: each PoE stage boundary gets its own
+    # trainable projection head that composes additively with the shared lm_head.
+    # logits_k = lm_head(x_k) + lm_head_stage_k(x_k) for stage k in 1..N.
+    # Requires poe_every to know how many stages exist at init time.
+    per_stage_head: bool = False
+    poe_every: int = 1
 
 
 def norm(x):
@@ -173,6 +190,25 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Dual-head specialist stage (paper §6.5). Zero-init so at step 0 the
+        # model is behavior-identical to the head-frozen baseline; gradients
+        # then let it accumulate a specialist projection additively on top of
+        # the frozen base lm_head.
+        if config.dual_head:
+            self.lm_head_stage = Linear(config.n_embd, padded_vocab_size, bias=False)
+            # zero-init is applied in init_weights() below and on load.
+        # Unified per-stage heads: one dedicated projection per PoE stage boundary.
+        # Composes additively with the shared lm_head at each stage during pretraining.
+        if config.per_stage_head:
+            num_stages = 0
+            for i in range(config.n_layer):
+                if (i + 1) % config.poe_every == 0 or i == config.n_layer - 1:
+                    num_stages += 1
+            self.num_poe_stages = num_stages
+            self.lm_head_stages = nn.ModuleList([
+                Linear(config.n_embd, padded_vocab_size, bias=False)
+                for _ in range(num_stages)
+            ])
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -217,6 +253,15 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Specialist head zero-init (dual-head only): behavior-identical to
+        # head-frozen SFT at step 0. Gradients fill in the chat-register delta.
+        if self.config.dual_head:
+            torch.nn.init.zeros_(self.lm_head_stage.weight)
+        # Per-stage heads zero-init: stage k projection starts as zero so step 0
+        # matches shared-head baseline; gradients then accumulate stage-specific residuals.
+        if self.config.per_stage_head:
+            for head in self.lm_head_stages:
+                torch.nn.init.zeros_(head.weight)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -353,6 +398,8 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        if self.config.per_stage_head:
+            lm_head += sum(p.numel() for p in self.lm_head_stages.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
@@ -375,6 +422,8 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        if self.config.per_stage_head:
+            lm_head_params = lm_head_params + list(self.lm_head_stages.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
@@ -409,12 +458,26 @@ class GPT(nn.Module):
         return optimizer
 
     def _poe_layer_loss(self, x, targets, teacher_top_logits=None, teacher_top_indices=None,
-                        kd_alpha=0.5, kd_temperature=2.0):
+                        kd_alpha=0.5, kd_temperature=2.0, use_stage_head=False, stage_idx=-1):
         """Compute CE loss (+ optional KD loss) from a hidden state through the shared lm_head.
         Used by PoE local learning. Gradient-checkpointed to avoid storing
-        full (B, T, vocab_size) logit tensors at every layer."""
+        full (B, T, vocab_size) logit tensors at every layer.
+
+        When ``use_stage_head`` is True AND ``config.dual_head`` is True, the
+        specialist head ``lm_head_stage`` projection is added to the base
+        ``lm_head`` projection in log-space before softcap (paper §6.5).
+
+        When ``config.per_stage_head`` is True and ``stage_idx >= 0``, the
+        corresponding ``lm_head_stages[stage_idx]`` projection is added to the
+        shared ``lm_head`` projection: logits_k = lm_head(x) + lm_head_stage_k(x).
+        """
         softcap = 15
-        logits = self.lm_head(norm(x))
+        x_norm = norm(x)
+        logits = self.lm_head(x_norm)
+        if self.config.per_stage_head and stage_idx >= 0:
+            logits = logits + self.lm_head_stages[stage_idx](x_norm)
+        if use_stage_head and self.config.dual_head:
+            logits = logits + self.lm_head_stage(x_norm)
         logits = logits[..., :self.config.vocab_size].float()
         logits = softcap * torch.tanh(logits / softcap)
         ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -440,7 +503,8 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', poe_mode=None, poe_every=1,
                 poe_alpha=0.0,
-                teacher_top_logits=None, teacher_top_indices=None, kd_alpha=0.5, kd_temperature=2.0):
+                teacher_top_logits=None, teacher_top_indices=None, kd_alpha=0.5, kd_temperature=2.0,
+                head_mode='dual'):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -485,6 +549,7 @@ class GPT(nn.Module):
         poe_head_count = 0
         if poe_mode is not None and targets is not None:
             poe_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        stage_idx = 0  # PoE stage counter (used by per_stage_head)
         for i, block in enumerate(self.transformer.h):
             # PoE flat: break gradient flow at stage boundaries
             if poe_mode == 'flat' and i > 0 and i % poe_every == 0:
@@ -496,11 +561,18 @@ class GPT(nn.Module):
                 x_backout = x
             # PoE: expert head at stage boundaries (every poe_every layers + last layer)
             if poe_loss is not None and ((i + 1) % poe_every == 0 or i == n_layer - 1):
+                # Dual-head (paper §6.5): only the final specialist-stage boundary
+                # composes lm_head + lm_head_stage. Earlier stage boundaries project
+                # through the frozen base head only.
+                use_stage_head = (i == n_layer - 1)
+                stage_idx_for_head = stage_idx if self.config.per_stage_head else -1
                 poe_loss = poe_loss + torch.utils.checkpoint.checkpoint(
                     self._poe_layer_loss, x, targets, teacher_top_logits, teacher_top_indices,
-                    kd_alpha, kd_temperature, use_reentrant=False,
+                    kd_alpha, kd_temperature, use_stage_head, stage_idx_for_head,
+                    use_reentrant=False,
                 )
                 poe_head_count += 1
+                stage_idx += 1
         # PoE mode: return aggregated per-stage loss, skip final projection
         # Normalization: poe_loss / n^(1-alpha) generalizes Bayesian PoE aggregation
         # alpha=0.0: uniform average (conjunction shrinkage, Log-OP)
@@ -515,9 +587,18 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
+        # Forward the lm_head (compute logits). With dual_head, `head_mode`
+        # selects which head(s) apply at the final stage (paper §6.5 / §10.2):
+        #   "dual" (default): lm_head(x) + lm_head_stage(x)  -- SFT composition
+        #   "base":           lm_head(x) only                -- base retrieval path
+        #   "spec":           lm_head_stage(x) only          -- specialist probe
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        if self.config.dual_head and head_mode == 'spec':
+            logits = self.lm_head_stage(x)
+        else:
+            logits = self.lm_head(x) # (B, T, padded_vocab_size)
+            if self.config.dual_head and head_mode == 'dual':
+                logits = logits + self.lm_head_stage(x)
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
