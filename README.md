@@ -1,213 +1,211 @@
-# nanochat
+# nanochat-poe
 
-![nanochat logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
+A research fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) that adds **Product of Experts (PoE) local learning** on top of the original training pipeline: each stage of the transformer trains independently through its own cross-entropy loss against a shared `lm_head`, and no gradient crosses stage boundaries. The fork tracks upstream nanochat (tokenizer, pretraining, SFT, evals, chat UI) and adds the training- and inference-time primitives needed to reproduce the experiments in the papers listed below.
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
+Upstream nanochat's README (leaderboard, speedrun story, guides) is preserved in `dev/UPSTREAM_README.md` for reference.
 
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
+## Papers
 
-## Time-to-GPT-2 Leaderboard
+This repository is the reference implementation for:
 
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
+1. **Product of Experts as Scalable Local Learning: Modular Construction at 1.3B Parameters** (Jeong, 2026). DOI: [10.5281/zenodo.19547653](https://doi.org/10.5281/zenodo.19547653). Production-scale validation of clustered PoE on a 1.3B-parameter GPT: 6.0% BPB gap vs. a matched-ratio backprop baseline on ClimbMix, WAND-style adaptive stage pruning (1.82x speedup, 100% top-1 agreement), Stage-1-as-drafter speculative decoding (1.87x), and compute-matched dual-head post-hoc SFT that preserves base-module predictions bit-identically while adding specialist capability.
+2. **Clustered Local Learning: Bridging Biological Plausibility and Practical LLM Training** (Jeong, 2026). The 897M result that motivates the clustered (per-stage, not per-layer) factorization and quantifies the 6.6% BPB gap / 1.33x wall-clock trade-off at `poe_every=5`.
+3. **Stateless Depth: Systems Advantages of Layer-Independent Transformer Training** (Jeong, 2026). The theoretical backbone: lossless prefix pruning, bubble-free pipeline parallelism, and elastic scaling, all derived from the absence of cross-layer backward dependencies.
 
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
-| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
+## What's new vs. upstream nanochat
 
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
+The diff against upstream is intentionally narrow. The GPT module, optimizer, data loader, and training loop are inherited; PoE additions are localized to a few well-defined hook points.
 
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
+| Capability | Flag / Script | Location |
+|------------|--------------|----------|
+| Clustered PoE training | `--poe-mode=flat --poe-every=N` | `scripts/base_train.py`, ~30-line hook in `nanochat/gpt.py` |
+| Per-stage loss aggregation exponent | `--poe-alpha=A` (`loss / n**(1-A)`) | `scripts/base_train.py` |
+| Per-stage additive heads | `--per-stage-head` | `nanochat/gpt.py` (`GPTConfig.per_stage_head`) |
+| PoE pipeline parallelism | `--pipeline-rank`, `--pipeline-peer-addr`, `--pipeline-port` | `scripts/base_train.py` |
+| Post-hoc specialist stage (elastic depth) | `scripts/specialist_sft_new_stage.py` | freezes base + shared head; trains only the appended stage |
+| Dual-head specialist SFT | `--dual-head` on `specialist_sft_new_stage.py` | base head preserved bit-identically; specialist head composes additively |
+| KD from external teacher | `scripts/run_kd_experiment.sh` + `scripts/generate_teacher_logits.py` | top-K logit distillation into PoE student |
+| FA3 / FA2 / SDPA cascade | auto-selected | `nanochat/flash_attention.py` |
 
-## Getting started
+The PoE surgery itself is a few lines in the transformer forward pass:
 
-### Setup
+```python
+for i, block in enumerate(self.transformer.h):
+    if poe_mode == "flat" and i > 0 and i % poe_every == 0:
+        x = x.detach()  # stage boundary
+    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+    x = block(x, ...)
+    if (i + 1) % poe_every == 0 or i == n_layer - 1:
+        poe_loss += checkpoint(self._poe_layer_loss, x, targets)
+```
 
-nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
+The shared `lm_head` adds zero parameters; `x0`-residual blending preserves a direct pathway from the embedding to every stage so per-stage detachment does not sever representational bandwidth.
+
+## Setup
+
+nanochat-poe uses [uv](https://docs.astral.sh/uv/) for dependency management, inherited from upstream:
 
 ```bash
-uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)
-uv sync --extra cpu    # (or) Use for CPU-only / MPS
+uv sync --extra gpu    # CUDA (A100/H100/...)
+uv sync --extra cpu    # CPU-only / Apple Silicon (MPS)
 source .venv/bin/activate
 ```
 
-For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
+For development (pytest, matplotlib, ipykernel, transformers, bitsandbytes, etc.):
 
 ```bash
 uv sync --extra gpu --group dev
 ```
 
-### Reproduce and talk to GPT-2
+## Running the PoE experiments
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+All commands below assume you are in the repository root and have the venv activated.
 
-```bash
-bash runs/speedrun.sh
-```
+### 1. Small-scale PoE vs. BP sanity check (`d20`, 8x A100/H100, single node)
 
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
+Runs a matched-baseline pair: standard backprop first, then flat clustered PoE with `poe_every=5` (four stages of five layers). Produces two checkpoints plus full training logs under `~/poe_results/`.
 
 ```bash
-python -m scripts.chat_web
+bash scripts/run_poe_experiment.sh
 ```
 
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
-
----
-
-<img width="2672" height="1520" alt="image" src="https://github.com/user-attachments/assets/ed39ddf8-2370-437a-bedc-0f39781e76b5" />
-
----
-
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
-
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
-```
-
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
-
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE score)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | No reduced-precision tensor cores |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
+Under the hood this calls:
 
 ```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
+uv run torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=20 \
+    --poe-mode=flat \
+    --poe-every=5 \
+    --device-batch-size=8
 ```
 
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
+Set `--poe-mode=none` to train the matched backprop baseline with everything else identical.
 
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
+### 2. 1.3B PoE with cross-node pipeline parallelism (`d24`, 2 nodes x 4 GPUs)
 
-## Guides
+PoE's detach boundaries double as pipeline split points: only forward activations cross the network, never gradients. This lets two commodity nodes (NVLink internal, modest cross-node bandwidth) train the Chinchilla-optimal d24 configuration.
 
-I've published a number of guides that might contain helpful information, most recent to least recent:
+On node 0 (first half, layers 0-11, embedding):
 
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
+```bash
+PIPELINE_PEER=<node1-ip> bash scripts/run_chinchilla_d24_pipeline.sh 0
+```
 
-## File structure
+On node 1 (second half, layers 12-23, `lm_head`):
+
+```bash
+PIPELINE_PEER=<node0-ip> bash scripts/run_chinchilla_d24_pipeline.sh 1
+```
+
+Tunable environment variables: `NPROC_PER_NODE` (default 4), `PIPELINE_PORT` (default 29600), `RESUME_FROM_STEP` (default -1, i.e. fresh run).
+
+### 3. Post-hoc specialist SFT (elastic depth, new stage only)
+
+Starts from a trained PoE base, appends N new transformer blocks as a fresh stage, and trains only those blocks (plus, with `--dual-head`, a dedicated additive head). The shared `lm_head` and all existing stages are frozen, so base-model predictions are preserved bit-identically.
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.specialist_sft_new_stage -- \
+    --model-tag=poe_d24_r10 \
+    --new-layers=6 \
+    --dual-head \
+    --smoltalk-epochs=1 \
+    --mmlu-epochs=3 \
+    --gsm8k-epochs=4 \
+    --output-tag=sft_new_stage_poe_d24_dual_head
+```
+
+Key flags:
+
+- `--model-tag` / `--model-step`: which base checkpoint to attach to (default: last step of the tag).
+- `--new-layers`: how many transformer blocks to append (defaults to 6; the new stage index is inferred from the existing PoE layout).
+- `--dual-head`: give the new stage its own trainable additive head on top of the frozen shared `lm_head` (the paper's recommended configuration; single-head SFT overwrites base predictions).
+- `--freeze-lm-head`: freeze the shared head without enabling `--dual-head` (rarely what you want; documented for ablation).
+- `--resume-from <step>`: resume a specialist-SFT run from a saved SFT checkpoint.
+- `--s3-upload-prefix <s3://bucket/path>` (optional): sync the final checkpoint under `<prefix>/<output-tag>/`. Omit this flag to skip S3 upload entirely (the default for public use).
+- Per-dataset epoch counts (`--smoltalk-epochs`, `--mmlu-epochs`, `--gsm8k-epochs`, `--code-alpaca-epochs`, `--glaive-fc-epochs`, `--xsum-epochs`, `--conll-epochs`, ...) control the specialist data mix. Set unwanted sources to 0.
+
+### 4. KD experiment (external teacher -> PoE student)
+
+Distills a large external teacher (e.g. Gemma-family) into a PoE student via top-K logit caching:
+
+```bash
+bash scripts/run_kd_experiment.sh
+```
+
+Phases: (0) data + tokenizer, (1) teacher logit generation (`scripts/generate_teacher_logits.py`, top-16 logits over 500M tokens), (2) student KD + PoE training (`--kd-logits-dir`, `--kd-alpha`, `--kd-temperature`). The script as shipped targets `google/gemma-4-31b-it` as teacher and a d32 PoE student with `poe_every=8`; edit the script in place to change teacher / depth / window pattern.
+
+## Inference primitives unique to PoE
+
+These follow directly from per-stage supervision and do not require retraining:
+
+- **Lossless stage-prefix inference**: running only the first `k` stages through the shared head yields the exact predictions that prefix had in the full model (Proposition 4.1 of the paper). At `d24` / r=10 the first stage alone recovers 87.5% of full-model factual accuracy.
+- **WAND-style adaptive stage pruning**: exit early on tokens whose top-1 margin exceeds the sum of remaining p99 logit-delta bounds. 1.82x wall-clock speedup at 100% top-1 agreement in the 1.3B run.
+- **Stage-1-as-drafter speculative decoding**: Stage 1 drafts K tokens at 25% compute; the full stack verifies K+1 positions in parallel. 1.87x speedup, no separate drafter network.
+- **Parallel composition of independently-trained branches**: two branches (e.g. `[1..4]` base, `[1..5]` dual-head specialist) log-sum their stage logits to produce a sharper joint distribution than either branch alone.
+
+Chat CLI / web UI for talking to a trained checkpoint are unchanged from upstream:
+
+```bash
+python -m scripts.chat_cli              # terminal
+python -m scripts.chat_web              # web UI on port 8000
+```
+
+## File structure (delta from upstream)
 
 ```
 .
-├── LICENSE
-├── README.md
-├── dev
-│   ├── gen_synthetic_data.py       # Example synthetic data for identity
-│   ├── generate_logo.html
-│   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
-├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
-│   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── logo.svg
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   ├── report.py                   # Utilities for writing the nanochat Report
-│   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-│   └── ui.html                     # HTML/CSS/JS for nanochat frontend
-├── pyproject.toml
-├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
-├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── chat_web.py                 # Chat model: talk to over WebUI
-│   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
-│   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── customjson.py               # Make Task from arbitrary jsonl convos
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-│   └── spellingbee.py              # Task teaching model to spell/count letters
-├── tests
-│   └── test_engine.py
-└── uv.lock
++-- nanochat/
+|   +-- gpt.py                          # PoE hook + per-stage heads + frozen-prefix support
+|   +-- flash_attention.py              # FA3/FA2/SDPA cascade
+|   +-- checkpoint_manager.py           # save_stage_delta for dual-head specialist SFT
+|   +-- ... (rest inherited from upstream)
++-- scripts/
+|   +-- base_train.py                   # + PoE flags, pipeline flags, KD flags
+|   +-- specialist_sft_new_stage.py     # post-hoc stage training (any stage count)
+|   +-- generate_teacher_logits.py      # top-K teacher logit caching for KD
+|   +-- run_poe_experiment.sh           # d20 PoE vs BP, single node
+|   +-- run_chinchilla_d24.sh           # d24 single-node reference
+|   +-- run_chinchilla_d24_pipeline.sh  # d24 2-node PoE pipeline
+|   +-- run_kd_experiment.sh            # teacher -> PoE student KD
+|   +-- gcp_*.sh                        # GCP cluster helpers (launch, sync, retry)
+|   +-- ... (upstream scripts unchanged)
++-- tasks/                              # upstream task mix + ner.py (CoNLL/FewNerd/WikiAnn)
++-- runs/                               # upstream runs (speedrun.sh, miniseries.sh, ...)
++-- dev/                                # upstream dev assets (logo, leaderboard, notebooks)
 ```
 
-## Contributing
+Everything else (dataloader, tokenizer, optimizer, engine, Web UI, task definitions) is inherited from upstream nanochat.
 
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~3 hours, but by improving the pretraining stage we can improve this further.
+## Precision / dtype
 
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
+Precision management is inherited verbatim from upstream: a single global `COMPUTE_DTYPE` auto-detected per hardware, overridable via `NANOCHAT_DTYPE`. Weights are stored in fp32 for optimizer precision; `nanochat.gpt.Linear` casts to `COMPUTE_DTYPE` during forward.
 
-## Acknowledgements
+| Hardware | Default | Reason |
+|----------|---------|--------|
+| CUDA SM 80+ (A100, H100) | `bfloat16` | Native bf16 tensor cores |
+| CUDA SM < 80 (V100, T4)  | `float32` | No bf16; `NANOCHAT_DTYPE=float16` enables fp16 + GradScaler |
+| CPU / MPS | `float32` | No reduced-precision tensor cores |
 
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
+fp16 training automatically enables a `GradScaler` in `base_train.py`. SFT supports this; RL currently does not. Inference in fp16 works everywhere.
 
-## Cite
+## Running on CPU / MPS
 
-If you find nanochat helpful in your research cite simply as:
+`runs/runcpu.sh` (inherited) shows a minimal-sized PoE run for CPU / Apple Silicon. Expect toy results; the script exists so the full pipeline can be exercised end-to-end on a laptop. MLX-port benchmarks (speculative decoding, parallel stage branching on M1 Ultra) are documented in the PoE paper (Section 7) but the MLX reimplementation lives outside this repository.
+
+## Citing this fork
+
+If you use nanochat-poe in your research, please cite both the relevant PoE paper and the upstream nanochat codebase:
 
 ```bibtex
+@misc{jeong2026poe,
+  author       = {Jaepil Jeong},
+  title        = {Product of Experts as Scalable Local Learning: Modular Construction at 1.3B Parameters},
+  year         = {2026},
+  institution  = {Cognica, Inc.},
+  doi          = {10.5281/zenodo.19547653},
+  url          = {https://doi.org/10.5281/zenodo.19547653}
+}
+
 @misc{nanochat,
   author = {Andrej Karpathy},
   title = {nanochat: The best ChatGPT that \$100 can buy},
@@ -217,6 +215,12 @@ If you find nanochat helpful in your research cite simply as:
 }
 ```
 
+## Acknowledgements
+
+- This fork builds directly on [Andrej Karpathy](https://github.com/karpathy)'s [nanochat](https://github.com/karpathy/nanochat); the base training recipe, tokenizer, evaluation harness, and web UI are his work.
+- The PoE framework is due to Geoffrey Hinton (Hinton, 2002); the present work instantiates it as a local-learning objective at LLM scale.
+- Thanks to [HuggingFace](https://huggingface.co/) for SmolTalk and ClimbMix-derived training data mixes used in upstream nanochat.
+
 ## License
 
-MIT
+MIT (inherited from upstream nanochat).
