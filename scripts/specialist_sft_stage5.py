@@ -94,6 +94,9 @@ parser.add_argument("--eval-every", type=int, default=200)
 parser.add_argument("--eval-tokens", type=int, default=40*524288)
 parser.add_argument("--save-every", type=int, default=-1)
 parser.add_argument("--output-tag", type=str, default=None)
+parser.add_argument("--s3-upload-prefix", type=str, default=None,
+                    help="S3 URL prefix (e.g. 's3://my-bucket/runs') to sync the final checkpoint to. "
+                         "The final destination is '{prefix}/{output_tag}/'. Omit to skip S3 upload.")
 parser.add_argument("--max-convs", type=int, default=-1,
                     help="Subsample training conversations to at most N (seed=42, deterministic). -1 = use all.")
 parser.add_argument("--val-convs", type=int, default=512,
@@ -1012,10 +1015,11 @@ if master_process:
         model_data = {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
         save_checkpoint(output_dir, num_steps, model_data, None, meta_save, rank=0)
     print0(f"Saved final checkpoint to {output_dir}")
-    # Upload to S3
-    print0("Uploading to S3...")
-    os.system(f"aws s3 sync {output_dir} s3://nanochat-checkpoint-transfer/sft_stage5_{args.model_tag}/ --exclude '*.pt' --include 'model_*.pt' --include 'meta_*.json'")
-    print0("Upload complete")
+    if args.s3_upload_prefix:
+        s3_dest = f"{args.s3_upload_prefix.rstrip('/')}/{output_tag}/"
+        print0(f"Uploading to {s3_dest}...")
+        os.system(f"aws s3 sync {output_dir} {s3_dest} --exclude '*.pt' --include 'model_*.pt' --include 'meta_*.json'")
+        print0("Upload complete")
 
 if ddp:
     dist.barrier()
