@@ -1,13 +1,14 @@
 """
-Specialist SFT with PoE Stage 5 addition (Section 8.8 Elastic Depth).
+Specialist SFT by appending a new PoE stage (Section 8.8 Elastic Depth).
 
-Adds new layers to the pretrained PoE model and fine-tunes only the new stage
-on specialist task data (chat, math, code, tool-calling, summarization, NER, ...).
-Existing stages are frozen.
+Adds new layers to the pretrained PoE model and fine-tunes only the newly
+appended stage on specialist task data (chat, math, code, tool-calling,
+summarization, NER, ...). Existing stages are frozen. Works for any number of
+pre-existing stages; the new stage's index is inferred from the checkpoint.
 
 Usage:
-    python -m scripts.specialist_sft_stage5
-    torchrun --nproc_per_node=8 -m scripts.specialist_sft_stage5
+    python -m scripts.specialist_sft_new_stage
+    torchrun --nproc_per_node=8 -m scripts.specialist_sft_new_stage
 """
 
 import os
@@ -89,6 +90,13 @@ parser.add_argument("--init-lr-frac", type=float, default=0.2)
 parser.add_argument("--warmup-ratio", type=float, default=0.05)
 parser.add_argument("--warmdown-ratio", type=float, default=0.5)
 parser.add_argument("--final-lr-frac", type=float, default=0.0)
+parser.add_argument("--end-token-weight", type=float, default=1.0,
+                    help="Weight multiplier for <|assistant_end|> CE contribution. "
+                    "Use <1.0 for sparse-assistant tasks (summary: 0.3) to prevent "
+                    "the model from exploiting the end-token shortcut.")
+parser.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="Label smoothing epsilon for assistant CE. 0.02 helped "
+                    "stabilize summary v9.")
 # Eval & save
 parser.add_argument("--eval-every", type=int, default=200)
 parser.add_argument("--eval-tokens", type=int, default=40*524288)
@@ -129,7 +137,7 @@ resume_step = args.resume_from or 0
 if resume_step > 0:
     # Resume from SFT checkpoint
     sft_dir = os.path.join(base_dir, "chatsft_checkpoints",
-                           args.output_tag or f"sft_stage5_{args.model_tag}")
+                           args.output_tag or f"sft_new_stage_{args.model_tag}")
     print0(f"Resuming from SFT checkpoint: step {resume_step}")
     with open(os.path.join(sft_dir, f"meta_{resume_step:06d}.json")) as f:
         meta = json.load(f)
@@ -445,9 +453,19 @@ def _patched_forward(self, idx, targets=None, kv_cache=None, loss_reduction='mea
     if targets is not None:
         # Sum mode (explicit via loss_reduction='sum', or implicit when not training
         # e.g. evaluate_bpb which toggles model.eval()) returns raw unweighted CE sum
-        # so val BPB remains comparable across tasks and runs. Training path applies
-        # <|assistant_end|> down-weighting only (weight_scale was removed: it inflated
-        # reported loss/bpb 3-16x and fed over-amplified gradients to the optimizer).
+        # so val BPB remains comparable across tasks and runs.
+        #
+        # Training path (v7): for sparse-assistant tasks like summarization the
+        # <|assistant_end|> token is the cheapest shortcut to minimize CE -- emit
+        # it early and the loss over the training distribution still drops fast
+        # because every sample ends with it. We counter with two measures:
+        #
+        #   (1) End-token weight 0.1x (was 0.5x in v6). Previous ratio was not
+        #       strong enough -- v6 still collapsed to empty output at s10981
+        #       even though val BPB was decent at s3000.
+        #   (2) Label smoothing eps=0.05 on the CE. Prevents the specialist head
+        #       from driving end-token confidence to 1.0 at the expense of the
+        #       real summary distribution.
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = targets.view(-1)
         if loss_reduction == 'sum' or not self.training:
@@ -455,13 +473,19 @@ def _patched_forward(self, idx, targets=None, kv_cache=None, loss_reduction='mea
                                    ignore_index=-1, reduction='sum')
         valid_mask = (flat_targets != -1).float()
         per_token_loss = F.cross_entropy(flat_logits, flat_targets,
-                                         ignore_index=-1, reduction='none')
-        END_TOKEN_ID = 32763  # <|assistant_end|>
-        end_mask = (flat_targets == END_TOKEN_ID).float()
-        per_token_weight = 1.0 - 0.5 * end_mask
-        weighted_loss = per_token_loss * per_token_weight * valid_mask
-        loss_sum = weighted_loss.sum()
-        denom = torch.clamp((valid_mask * per_token_weight).sum(), min=1.0).to(loss_sum.dtype)
+                                         ignore_index=-1, reduction='none',
+                                         label_smoothing=args.label_smoothing)
+        if args.end_token_weight != 1.0:
+            END_TOKEN_ID = 32763  # <|assistant_end|>
+            end_mask = (flat_targets == END_TOKEN_ID).float()
+            per_token_weight = 1.0 - (1.0 - args.end_token_weight) * end_mask
+            weighted_loss = per_token_loss * per_token_weight * valid_mask
+            loss_sum = weighted_loss.sum()
+            denom = torch.clamp((valid_mask * per_token_weight).sum(), min=1.0).to(loss_sum.dtype)
+        else:
+            weighted_loss = per_token_loss * valid_mask
+            loss_sum = weighted_loss.sum()
+            denom = torch.clamp(valid_mask.sum(), min=1.0).to(loss_sum.dtype)
         return loss_sum / denom
     return logits
 
@@ -791,7 +815,7 @@ def get_muon_momentum(step):
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-output_tag = args.output_tag or f"sft_stage5_{args.model_tag}"
+output_tag = args.output_tag or f"sft_new_stage_{args.model_tag}"
 output_dir = os.path.join(base_dir, "chatsft_checkpoints", output_tag)
 if master_process:
     os.makedirs(output_dir, exist_ok=True)
@@ -972,7 +996,7 @@ for step in range(start_step, num_steps + 1):
         t0 = time.time()  # reset so eval time doesn't inflate next tok/s reading
 
     # Save checkpoint (delta-only when dual-head; full-sd otherwise for
-    # backward compatibility with legacy single-head stage5 runs)
+    # backward compatibility with legacy single-head new-stage runs)
     if args.save_every > 0 and step % args.save_every == 0 and master_process:
         meta_save = {"step": step, "smooth_loss": smooth_loss,
                      "model_config": {"sequence_len": new_config.sequence_len,

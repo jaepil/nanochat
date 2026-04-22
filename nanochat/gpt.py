@@ -45,8 +45,8 @@ class GPTConfig:
     # which heads apply ("dual" | "base" | "spec").
     dual_head: bool = False
     # Number of leading layers whose gradients are blocked (paper §6.1 elastic
-    # depth). Used with --new-layers in specialist_sft_stage5 to freeze the pretrained
-    # prefix while training only the new stage.
+    # depth). Used with --new-layers in specialist_sft_new_stage to freeze the
+    # pretrained prefix while training only the newly appended stage.
     frozen_layers: int = 0
     # Unified per-stage head architecture: each PoE stage boundary gets its own
     # trainable projection head that composes additively with the shared lm_head.
