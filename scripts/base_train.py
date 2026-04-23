@@ -50,6 +50,7 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--intermediate-size", type=int, default=0, help="MLP inner width (0 = legacy 4*n_embd). Use to param-match a wider-MLP baseline.")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -193,6 +194,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         per_stage_head=args.per_stage_head,
         poe_every=args.poe_every,
+        intermediate_size=args.intermediate_size,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

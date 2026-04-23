@@ -54,6 +54,11 @@ class GPTConfig:
     # Requires poe_every to know how many stages exist at init time.
     per_stage_head: bool = False
     poe_every: int = 1
+    # MLP inner width. 0 (default) preserves the legacy 4*n_embd ratio; a positive
+    # value lets callers widen the feed-forward block independent of n_embd, which
+    # is how we parameter-match a BP baseline to a PoE per-stage-head run without
+    # altering depth or attention shape.
+    intermediate_size: int = 0
 
 
 def norm(x):
@@ -146,8 +151,9 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        inner = config.intermediate_size if config.intermediate_size > 0 else 4 * config.n_embd
+        self.c_fc = Linear(config.n_embd, inner, bias=False)
+        self.c_proj = Linear(inner, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
