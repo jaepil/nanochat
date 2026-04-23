@@ -554,6 +554,13 @@ class GPT(nn.Module):
         poe_head_count = 0
         if poe_mode is not None and targets is not None:
             poe_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+        # Per-stage-head aggregation: collect hidden states at stage boundaries
+        # for eval/inference so we can combine stage heads the same way training
+        # did (Bayesian PoE over per-stage log-probs). Skipped when poe_loss is
+        # active (training already computes the aggregated CE directly).
+        collect_stage_x = (self.config.per_stage_head and poe_loss is None)
+        stage_x_list = [] if collect_stage_x else None
+        poe_every_eff = self.config.poe_every if collect_stage_x else poe_every
         stage_idx = 0  # PoE stage counter (used by per_stage_head)
         for i, block in enumerate(self.transformer.h):
             # PoE flat: break gradient flow at stage boundaries
@@ -564,6 +571,8 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
+            if stage_x_list is not None and ((i + 1) % poe_every_eff == 0 or i == n_layer - 1):
+                stage_x_list.append(x)
             # PoE: expert head at stage boundaries (every poe_every layers + last layer)
             if poe_loss is not None and ((i + 1) % poe_every == 0 or i == n_layer - 1):
                 # Dual-head (paper §6.5): only the final specialist-stage boundary
@@ -587,6 +596,37 @@ class GPT(nn.Module):
             # Touch unused parameters with zero so DDP all_reduce doesn't get None grads
             poe_loss = poe_loss + 0.0 * (self.backout_lambda.sum() + self.smear_gate.weight.sum() + self.smear_lambda.sum())
             return poe_loss / (poe_head_count ** (1.0 - poe_alpha))
+        # Per-stage-head eval / inference: aggregate per-stage log-probs per
+        # Bayesian PoE, matching training's per-stage CE formula:
+        #   agg_log_p = (1 / n^(1-alpha)) sum_k log_softmax(lm_head(norm(x_k)) + lm_head_stages[k](norm(x_k)))
+        # Backout is intentionally skipped: stage heads were trained without it.
+        if stage_x_list is not None:
+            softcap = 15
+            agg_log_p = None
+            for k, x_k in enumerate(stage_x_list):
+                x_k_norm = norm(x_k)
+                logits_k = self.lm_head(x_k_norm) + self.lm_head_stages[k](x_k_norm)
+                logits_k = logits_k[..., :self.config.vocab_size].float()
+                logits_k = softcap * torch.tanh(logits_k / softcap)
+                log_p_k = F.log_softmax(logits_k, dim=-1)
+                agg_log_p = log_p_k if agg_log_p is None else agg_log_p + log_p_k
+            n_stages = len(stage_x_list)
+            agg_log_p = agg_log_p / (n_stages ** (1.0 - poe_alpha))
+            if targets is None:
+                # Inference: return log-probs shaped like logits (softmax/argmax invariant)
+                return agg_log_p
+            # Eval: compute NLL per token; reshape matches the single-head CE path
+            tgt = targets.view(-1)
+            lp_flat = agg_log_p.view(-1, agg_log_p.size(-1))
+            valid = tgt >= 0
+            tgt_safe = torch.where(valid, tgt, torch.zeros_like(tgt))
+            nll = -lp_flat.gather(-1, tgt_safe.unsqueeze(-1)).squeeze(-1)
+            nll = torch.where(valid, nll, torch.zeros_like(nll))
+            if loss_reduction == 'none':
+                return nll.view(targets.shape)
+            if loss_reduction == 'sum':
+                return nll.sum()
+            return nll.sum() / valid.sum().clamp(min=1)
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
